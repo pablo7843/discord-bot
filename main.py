@@ -7,6 +7,25 @@ from dotenv import load_dotenv
 import datetime
 import pytz
 import dateparser
+# Importaciones nuevas para Render
+from flask import Flask
+from threading import Thread
+
+# --- FUNCIONALIDAD KEEP ALIVE PARA RENDER ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot está vivo!"
+
+def run():
+    # Render usa puertos dinámicos, el 8080 es el estándar de la industria
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+# --------------------------------------------
 
 # 1. Configuración Inicial
 load_dotenv()
@@ -173,5 +192,9 @@ async def hoy(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"Error al obtener agenda: {e}", ephemeral=True)
 
-# Ejecución del bot
-client.run(os.getenv("DISCORD_TOKEN"))
+# --- EJECUCIÓN ---
+if __name__ == "__main__":
+    # Arrancamos el servidor web Flask en segundo plano
+    keep_alive()
+    # Ejecución del bot de Discord
+    client.run(os.getenv("DISCORD_TOKEN"))
