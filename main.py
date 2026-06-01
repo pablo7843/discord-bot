@@ -2,18 +2,29 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from supabase import create_client, Client
+from dotenv import load_dotenv
 import datetime
 import pytz
 import dateparser
-import aiosqlite
-from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 
+# ── Keep-alive para Render ────────────────────────────────────────────────────
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot está vivo!"
+
+def keep_alive():
+    t = Thread(target=lambda: app.run(host='0.0.0.0', port=8080))
+    t.daemon = True
+    t.start()
+
+# ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
-
 ZONA_ES = pytz.timezone('Europe/Madrid')
-DB_PATH = "data/recordatorios.db"
-os.makedirs("data", exist_ok=True)
-
 DIAS_ES = {
     0: "Lunes", 1: "Martes", 2: "Miércoles",
     3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo"
@@ -29,7 +40,7 @@ def _parsear_fecha(cuando: str) -> datetime.datetime | None:
     })
 
 
-def _dt_de_db(s: str) -> datetime.datetime:
+def _dt_de_str(s: str) -> datetime.datetime:
     dt = datetime.datetime.fromisoformat(s)
     return dt if dt.tzinfo else dt.replace(tzinfo=pytz.utc)
 
@@ -38,23 +49,12 @@ class CalendarBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
-        self.db: aiosqlite.Connection = None
+        self.supabase: Client = create_client(
+            os.getenv("SUPABASE_URL"),
+            os.getenv("SUPABASE_KEY")
+        )
 
     async def setup_hook(self):
-        self.db = await aiosqlite.connect(DB_PATH)
-        self.db.row_factory = aiosqlite.Row
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS recordatorios (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                usuario_id INTEGER NOT NULL,
-                tarea TEXT NOT NULL,
-                descripcion TEXT DEFAULT '',
-                fecha_ejecucion TEXT NOT NULL,
-                completado INTEGER DEFAULT 0,
-                preaviso_enviado INTEGER DEFAULT 0
-            )
-        """)
-        await self.db.commit()
         self.revisar_alertas.start()
 
     async def on_ready(self):
@@ -62,72 +62,68 @@ class CalendarBot(discord.Client):
         await self.tree.sync()
         print("🚀 Comandos sincronizados.")
 
-    async def close(self):
-        if self.db:
-            await self.db.close()
-        await super().close()
-
     @tasks.loop(minutes=1)
     async def revisar_alertas(self):
         ahora_utc = datetime.datetime.now(pytz.utc)
+        try:
+            # Recordatorios que ya tocaron
+            res = self.supabase.table("recordatorios")\
+                .select("*")\
+                .eq("completado", False)\
+                .lte("fecha_ejecucion", ahora_utc.isoformat())\
+                .execute()
 
-        # Recordatorios que ya tocaron
-        async with self.db.execute(
-            "SELECT * FROM recordatorios WHERE completado=0 AND fecha_ejecucion <= ?",
-            (ahora_utc.isoformat(),)
-        ) as cur:
-            filas = await cur.fetchall()
+            for r in res.data:
+                embed = discord.Embed(
+                    title="⏰ ¡RECORDATORIO!",
+                    description=f"**{r['tarea']}**",
+                    color=discord.Color.red()
+                )
+                if r.get('descripcion'):
+                    embed.add_field(name="Detalles", value=r['descripcion'], inline=False)
+                try:
+                    user = await self.fetch_user(int(r['usuario_id']))
+                    if user:
+                        await user.send(embed=embed)
+                except Exception as e:
+                    print(f"Error enviando recordatorio {r['id']}: {e}")
+                self.supabase.table("recordatorios")\
+                    .update({"completado": True})\
+                    .eq("id", r['id'])\
+                    .execute()
 
-        for r in filas:
-            embed = discord.Embed(
-                title="⏰ ¡RECORDATORIO!",
-                description=f"**{r['tarea']}**",
-                color=discord.Color.red()
-            )
-            if r['descripcion']:
-                embed.add_field(name="Detalles", value=r['descripcion'], inline=False)
-            try:
-                user = await self.fetch_user(int(r['usuario_id']))
-                if user:
-                    await user.send(embed=embed)
-            except Exception as e:
-                print(f"Error enviando recordatorio {r['id']}: {e}")
-            await self.db.execute(
-                "UPDATE recordatorios SET completado=1 WHERE id=?", (r['id'],)
-            )
-        if filas:
-            await self.db.commit()
+            # Pre-avisos: ventana 25-35 min antes
+            ventana_ini = (ahora_utc + datetime.timedelta(minutes=25)).isoformat()
+            ventana_fin = (ahora_utc + datetime.timedelta(minutes=35)).isoformat()
 
-        # Pre-avisos: ventana de 25-35 min antes (se envía una sola vez por preaviso_enviado)
-        ventana_ini = (ahora_utc + datetime.timedelta(minutes=25)).isoformat()
-        ventana_fin = (ahora_utc + datetime.timedelta(minutes=35)).isoformat()
+            preaviso = self.supabase.table("recordatorios")\
+                .select("*")\
+                .eq("completado", False)\
+                .eq("preaviso_enviado", False)\
+                .gte("fecha_ejecucion", ventana_ini)\
+                .lte("fecha_ejecucion", ventana_fin)\
+                .execute()
 
-        async with self.db.execute(
-            """SELECT * FROM recordatorios
-               WHERE completado=0 AND preaviso_enviado=0
-               AND fecha_ejecucion >= ? AND fecha_ejecucion <= ?""",
-            (ventana_ini, ventana_fin)
-        ) as cur:
-            preaviso_filas = await cur.fetchall()
+            for r in preaviso.data:
+                try:
+                    user = await self.fetch_user(int(r['usuario_id']))
+                    if user:
+                        fecha_local = _dt_de_str(r['fecha_ejecucion']).astimezone(ZONA_ES)
+                        embed = discord.Embed(
+                            title="🔔 Recordatorio en ~30 minutos",
+                            description=f"**{r['tarea']}**\n🕒 A las {fecha_local.strftime('%H:%M')}",
+                            color=discord.Color.yellow()
+                        )
+                        await user.send(embed=embed)
+                except Exception as e:
+                    print(f"Error enviando pre-aviso {r['id']}: {e}")
+                self.supabase.table("recordatorios")\
+                    .update({"preaviso_enviado": True})\
+                    .eq("id", r['id'])\
+                    .execute()
 
-        for r in preaviso_filas:
-            try:
-                user = await self.fetch_user(int(r['usuario_id']))
-                if user:
-                    fecha_local = _dt_de_db(r['fecha_ejecucion']).astimezone(ZONA_ES)
-                    embed = discord.Embed(
-                        title="🔔 Recordatorio en ~30 minutos",
-                        description=f"**{r['tarea']}**\n🕒 A las {fecha_local.strftime('%H:%M')}",
-                        color=discord.Color.yellow()
-                    )
-                    await user.send(embed=embed)
-            except Exception as e:
-                print(f"Error enviando pre-aviso {r['id']}: {e}")
-            await self.db.execute(
-                "UPDATE recordatorios SET preaviso_enviado=1 WHERE id=?", (r['id'],)
-            )
-        if preaviso_filas:
-            await self.db.commit()
+        except Exception as e:
+            print(f"Error en el bucle de revisión: {e}")
 
     @revisar_alertas.before_loop
     async def before_revisar_alertas(self):
@@ -151,45 +147,54 @@ async def nuevo(interaction: discord.Interaction, tarea: str, cuando: str, descr
             "❌ No entendí la fecha. Prueba: 'mañana a las 14:00', 'el lunes a las 9', 'en 2 horas'.",
             ephemeral=True
         )
+    try:
+        client.supabase.table("recordatorios").insert({
+            "usuario_id": interaction.user.id,
+            "tarea": tarea,
+            "descripcion": descripcion,
+            "fecha_ejecucion": fecha_dt.isoformat(),
+            "completado": False,
+            "preaviso_enviado": False
+        }).execute()
 
-    await client.db.execute(
-        "INSERT INTO recordatorios (usuario_id, tarea, descripcion, fecha_ejecucion) VALUES (?, ?, ?, ?)",
-        (interaction.user.id, tarea, descripcion, fecha_dt.isoformat())
-    )
-    await client.db.commit()
-
-    fecha_local = fecha_dt.astimezone(ZONA_ES).strftime('%d/%m/%Y a las %H:%M')
-    embed = discord.Embed(title="✅ Recordatorio guardado", color=discord.Color.green())
-    embed.add_field(name="Tarea", value=tarea, inline=False)
-    embed.add_field(name="Cuándo (España)", value=fecha_local, inline=False)
-    if descripcion:
-        embed.add_field(name="Descripción", value=descripcion, inline=False)
-    await interaction.response.send_message(embed=embed)
+        fecha_local = fecha_dt.astimezone(ZONA_ES).strftime('%d/%m/%Y a las %H:%M')
+        embed = discord.Embed(title="✅ Recordatorio guardado", color=discord.Color.green())
+        embed.add_field(name="Tarea", value=tarea, inline=False)
+        embed.add_field(name="Cuándo (España)", value=fecha_local, inline=False)
+        if descripcion:
+            embed.add_field(name="Descripción", value=descripcion, inline=False)
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error al guardar: {e}", ephemeral=True)
 
 
 # ── /listar ───────────────────────────────────────────────────────────────────
 @client.tree.command(name="listar", description="Muestra todos tus recordatorios pendientes")
 async def listar(interaction: discord.Interaction):
-    async with client.db.execute(
-        "SELECT * FROM recordatorios WHERE usuario_id=? AND completado=0 ORDER BY fecha_ejecucion",
-        (interaction.user.id,)
-    ) as cur:
-        filas = await cur.fetchall()
+    try:
+        res = client.supabase.table("recordatorios")\
+            .select("*")\
+            .eq("usuario_id", interaction.user.id)\
+            .eq("completado", False)\
+            .order("fecha_ejecucion")\
+            .execute()
 
-    if not filas:
-        return await interaction.response.send_message(
-            "No tienes recordatorios pendientes.", ephemeral=True
-        )
+        if not res.data:
+            return await interaction.response.send_message(
+                "No tienes recordatorios pendientes.", ephemeral=True
+            )
 
-    embed = discord.Embed(title="📅 Tus recordatorios pendientes", color=discord.Color.blue())
-    for r in filas:
-        fecha_local = _dt_de_db(r['fecha_ejecucion']).astimezone(ZONA_ES)
-        embed.add_field(
-            name=f"🆔 {r['id']} — {r['tarea']}",
-            value=f"🕒 {fecha_local.strftime('%d/%m/%Y a las %H:%M')}",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed)
+        embed = discord.Embed(title="📅 Tus recordatorios pendientes", color=discord.Color.blue())
+        for r in res.data:
+            fecha_local = _dt_de_str(r['fecha_ejecucion']).astimezone(ZONA_ES)
+            embed.add_field(
+                name=f"🆔 {r['id']} — {r['tarea']}",
+                value=f"🕒 {fecha_local.strftime('%d/%m/%Y a las %H:%M')}",
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── /hoy ──────────────────────────────────────────────────────────────────────
@@ -198,31 +203,33 @@ async def hoy(interaction: discord.Interaction):
     ahora_es = datetime.datetime.now(ZONA_ES)
     inicio = ahora_es.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(pytz.utc)
     fin = inicio + datetime.timedelta(days=1)
+    try:
+        res = client.supabase.table("recordatorios")\
+            .select("*")\
+            .eq("usuario_id", interaction.user.id)\
+            .gte("fecha_ejecucion", inicio.isoformat())\
+            .lt("fecha_ejecucion", fin.isoformat())\
+            .order("fecha_ejecucion")\
+            .execute()
 
-    async with client.db.execute(
-        """SELECT * FROM recordatorios WHERE usuario_id=?
-           AND fecha_ejecucion >= ? AND fecha_ejecucion < ?
-           ORDER BY fecha_ejecucion""",
-        (interaction.user.id, inicio.isoformat(), fin.isoformat())
-    ) as cur:
-        filas = await cur.fetchall()
-
-    embed = discord.Embed(
-        title=f"📌 {DIAS_ES[ahora_es.weekday()]} {ahora_es.strftime('%d/%m/%Y')}",
-        color=discord.Color.orange()
-    )
-    if not filas:
-        embed.description = "No tienes nada programado para hoy. 🎉"
-    else:
-        for r in filas:
-            hora = _dt_de_db(r['fecha_ejecucion']).astimezone(ZONA_ES).strftime('%H:%M')
-            estado = "✅" if r['completado'] else "⏳"
-            embed.add_field(
-                name=f"{estado} {hora} — {r['tarea']}",
-                value=r['descripcion'] or "Sin detalles",
-                inline=False
-            )
-    await interaction.response.send_message(embed=embed)
+        embed = discord.Embed(
+            title=f"📌 {DIAS_ES[ahora_es.weekday()]} {ahora_es.strftime('%d/%m/%Y')}",
+            color=discord.Color.orange()
+        )
+        if not res.data:
+            embed.description = "No tienes nada programado para hoy. 🎉"
+        else:
+            for r in res.data:
+                hora = _dt_de_str(r['fecha_ejecucion']).astimezone(ZONA_ES).strftime('%H:%M')
+                estado = "✅" if r['completado'] else "⏳"
+                embed.add_field(
+                    name=f"{estado} {hora} — {r['tarea']}",
+                    value=r.get('descripcion') or "Sin detalles",
+                    inline=False
+                )
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── /semana ───────────────────────────────────────────────────────────────────
@@ -231,51 +238,53 @@ async def semana(interaction: discord.Interaction):
     ahora_es = datetime.datetime.now(ZONA_ES)
     inicio = ahora_es.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(pytz.utc)
     fin = inicio + datetime.timedelta(days=7)
+    try:
+        res = client.supabase.table("recordatorios")\
+            .select("*")\
+            .eq("usuario_id", interaction.user.id)\
+            .eq("completado", False)\
+            .gte("fecha_ejecucion", inicio.isoformat())\
+            .lt("fecha_ejecucion", fin.isoformat())\
+            .order("fecha_ejecucion")\
+            .execute()
 
-    async with client.db.execute(
-        """SELECT * FROM recordatorios WHERE usuario_id=? AND completado=0
-           AND fecha_ejecucion >= ? AND fecha_ejecucion < ?
-           ORDER BY fecha_ejecucion""",
-        (interaction.user.id, inicio.isoformat(), fin.isoformat())
-    ) as cur:
-        filas = await cur.fetchall()
-
-    embed = discord.Embed(title="📆 Agenda — próximos 7 días", color=discord.Color.purple())
-    if not filas:
-        embed.description = "No tienes nada para esta semana. ✨"
-    else:
-        dia_actual = None
-        for r in filas:
-            fecha_local = _dt_de_db(r['fecha_ejecucion']).astimezone(ZONA_ES)
-            dia_str = f"{DIAS_ES[fecha_local.weekday()]} {fecha_local.strftime('%d/%m')}"
-            if dia_str != dia_actual:
-                dia_actual = dia_str
-                embed.add_field(name=f"── {dia_str} ──", value="​", inline=False)
-            embed.add_field(
-                name=f"🆔{r['id']} {fecha_local.strftime('%H:%M')} — {r['tarea']}",
-                value=r['descripcion'] or "Sin detalles",
-                inline=False
-            )
-    await interaction.response.send_message(embed=embed)
+        embed = discord.Embed(title="📆 Agenda — próximos 7 días", color=discord.Color.purple())
+        if not res.data:
+            embed.description = "No tienes nada para esta semana. ✨"
+        else:
+            dia_actual = None
+            for r in res.data:
+                fecha_local = _dt_de_str(r['fecha_ejecucion']).astimezone(ZONA_ES)
+                dia_str = f"{DIAS_ES[fecha_local.weekday()]} {fecha_local.strftime('%d/%m')}"
+                if dia_str != dia_actual:
+                    dia_actual = dia_str
+                    embed.add_field(name=f"── {dia_str} ──", value="​", inline=False)
+                embed.add_field(
+                    name=f"🆔{r['id']} {fecha_local.strftime('%H:%M')} — {r['tarea']}",
+                    value=r.get('descripcion') or "Sin detalles",
+                    inline=False
+                )
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── /eliminar ─────────────────────────────────────────────────────────────────
 @client.tree.command(name="eliminar", description="Elimina un recordatorio por su ID")
 @app_commands.describe(id_tarea="ID del recordatorio (usa /listar para verlos)")
 async def eliminar(interaction: discord.Interaction, id_tarea: int):
-    async with client.db.execute(
-        "SELECT usuario_id FROM recordatorios WHERE id=?", (id_tarea,)
-    ) as cur:
-        fila = await cur.fetchone()
+    try:
+        check = client.supabase.table("recordatorios")\
+            .select("usuario_id").eq("id", id_tarea).execute()
 
-    if not fila or int(fila['usuario_id']) != interaction.user.id:
-        return await interaction.response.send_message(
-            "❌ No encontrado o sin permiso.", ephemeral=True
-        )
-
-    await client.db.execute("DELETE FROM recordatorios WHERE id=?", (id_tarea,))
-    await client.db.commit()
-    await interaction.response.send_message(f"🗑️ Recordatorio `{id_tarea}` eliminado.")
+        if not check.data or int(check.data[0]['usuario_id']) != interaction.user.id:
+            return await interaction.response.send_message(
+                "❌ No encontrado o sin permiso.", ephemeral=True
+            )
+        client.supabase.table("recordatorios").delete().eq("id", id_tarea).execute()
+        await interaction.response.send_message(f"🗑️ Recordatorio `{id_tarea}` eliminado.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── /editar ───────────────────────────────────────────────────────────────────
@@ -286,49 +295,47 @@ async def eliminar(interaction: discord.Interaction, id_tarea: int):
     descripcion="Nueva descripción (opcional)"
 )
 async def editar(interaction: discord.Interaction, id_tarea: int, cuando: str = "", descripcion: str = ""):
-    async with client.db.execute(
-        "SELECT * FROM recordatorios WHERE id=? AND usuario_id=?",
-        (id_tarea, interaction.user.id)
-    ) as cur:
-        fila = await cur.fetchone()
+    try:
+        check = client.supabase.table("recordatorios")\
+            .select("usuario_id").eq("id", id_tarea).execute()
 
-    if not fila:
-        return await interaction.response.send_message(
-            "❌ No encontrado o sin permiso.", ephemeral=True
-        )
-    if not cuando and not descripcion:
-        return await interaction.response.send_message(
-            "Indica al menos una cosa a cambiar: `cuando` o `descripcion`.", ephemeral=True
-        )
-
-    nueva_fecha = None
-    if cuando:
-        nueva_fecha = _parsear_fecha(cuando)
-        if not nueva_fecha:
+        if not check.data or int(check.data[0]['usuario_id']) != interaction.user.id:
             return await interaction.response.send_message(
-                "❌ No entendí la nueva fecha.", ephemeral=True
+                "❌ No encontrado o sin permiso.", ephemeral=True
             )
-        await client.db.execute(
-            "UPDATE recordatorios SET fecha_ejecucion=?, preaviso_enviado=0 WHERE id=?",
-            (nueva_fecha.isoformat(), id_tarea)
-        )
-    if descripcion:
-        await client.db.execute(
-            "UPDATE recordatorios SET descripcion=? WHERE id=?", (descripcion, id_tarea)
-        )
-    await client.db.commit()
+        if not cuando and not descripcion:
+            return await interaction.response.send_message(
+                "Indica al menos una cosa a cambiar: `cuando` o `descripcion`.", ephemeral=True
+            )
 
-    embed = discord.Embed(title="✏️ Recordatorio actualizado", color=discord.Color.green())
-    embed.add_field(name="ID", value=str(id_tarea), inline=True)
-    if nueva_fecha:
-        embed.add_field(
-            name="Nueva fecha",
-            value=nueva_fecha.astimezone(ZONA_ES).strftime('%d/%m/%Y a las %H:%M'),
-            inline=True
-        )
-    if descripcion:
-        embed.add_field(name="Nueva descripción", value=descripcion, inline=False)
-    await interaction.response.send_message(embed=embed)
+        nueva_fecha = None
+        cambios = {}
+        if cuando:
+            nueva_fecha = _parsear_fecha(cuando)
+            if not nueva_fecha:
+                return await interaction.response.send_message(
+                    "❌ No entendí la nueva fecha.", ephemeral=True
+                )
+            cambios["fecha_ejecucion"] = nueva_fecha.isoformat()
+            cambios["preaviso_enviado"] = False
+        if descripcion:
+            cambios["descripcion"] = descripcion
+
+        client.supabase.table("recordatorios").update(cambios).eq("id", id_tarea).execute()
+
+        embed = discord.Embed(title="✏️ Recordatorio actualizado", color=discord.Color.green())
+        embed.add_field(name="ID", value=str(id_tarea), inline=True)
+        if nueva_fecha:
+            embed.add_field(
+                name="Nueva fecha",
+                value=nueva_fecha.astimezone(ZONA_ES).strftime('%d/%m/%Y a las %H:%M'),
+                inline=True
+            )
+        if descripcion:
+            embed.add_field(name="Nueva descripción", value=descripcion, inline=False)
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── /posponer ─────────────────────────────────────────────────────────────────
@@ -338,82 +345,102 @@ async def editar(interaction: discord.Interaction, id_tarea: int, cuando: str = 
     cuando="Nueva fecha: 'en 1 hora', 'en 30 minutos', 'mañana a las 10'"
 )
 async def posponer(interaction: discord.Interaction, id_tarea: int, cuando: str):
-    async with client.db.execute(
-        "SELECT usuario_id FROM recordatorios WHERE id=?", (id_tarea,)
-    ) as cur:
-        fila = await cur.fetchone()
+    try:
+        check = client.supabase.table("recordatorios")\
+            .select("usuario_id").eq("id", id_tarea).execute()
 
-    if not fila or int(fila['usuario_id']) != interaction.user.id:
-        return await interaction.response.send_message(
-            "❌ No encontrado o sin permiso.", ephemeral=True
+        if not check.data or int(check.data[0]['usuario_id']) != interaction.user.id:
+            return await interaction.response.send_message(
+                "❌ No encontrado o sin permiso.", ephemeral=True
+            )
+
+        nueva_fecha = _parsear_fecha(cuando)
+        if not nueva_fecha:
+            return await interaction.response.send_message(
+                "❌ No entendí. Prueba: 'en 1 hora', 'en 30 minutos', 'mañana a las 10'.", ephemeral=True
+            )
+
+        client.supabase.table("recordatorios").update({
+            "fecha_ejecucion": nueva_fecha.isoformat(),
+            "completado": False,
+            "preaviso_enviado": False
+        }).eq("id", id_tarea).execute()
+
+        fecha_local = nueva_fecha.astimezone(ZONA_ES).strftime('%d/%m/%Y a las %H:%M')
+        await interaction.response.send_message(
+            f"⏩ Recordatorio `{id_tarea}` pospuesto hasta el **{fecha_local}**."
         )
-
-    nueva_fecha = _parsear_fecha(cuando)
-    if not nueva_fecha:
-        return await interaction.response.send_message(
-            "❌ No entendí. Prueba: 'en 1 hora', 'en 30 minutos', 'mañana a las 10'.", ephemeral=True
-        )
-
-    await client.db.execute(
-        "UPDATE recordatorios SET fecha_ejecucion=?, completado=0, preaviso_enviado=0 WHERE id=?",
-        (nueva_fecha.isoformat(), id_tarea)
-    )
-    await client.db.commit()
-
-    fecha_local = nueva_fecha.astimezone(ZONA_ES).strftime('%d/%m/%Y a las %H:%M')
-    await interaction.response.send_message(
-        f"⏩ Recordatorio `{id_tarea}` pospuesto hasta el **{fecha_local}**."
-    )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── /completar ────────────────────────────────────────────────────────────────
 @client.tree.command(name="completar", description="Marca un recordatorio como completado manualmente")
 @app_commands.describe(id_tarea="ID del recordatorio")
 async def completar(interaction: discord.Interaction, id_tarea: int):
-    async with client.db.execute(
-        "SELECT usuario_id FROM recordatorios WHERE id=?", (id_tarea,)
-    ) as cur:
-        fila = await cur.fetchone()
+    try:
+        check = client.supabase.table("recordatorios")\
+            .select("usuario_id").eq("id", id_tarea).execute()
 
-    if not fila or int(fila['usuario_id']) != interaction.user.id:
-        return await interaction.response.send_message(
-            "❌ No encontrado o sin permiso.", ephemeral=True
-        )
-
-    await client.db.execute("UPDATE recordatorios SET completado=1 WHERE id=?", (id_tarea,))
-    await client.db.commit()
-    await interaction.response.send_message(f"✅ Recordatorio `{id_tarea}` marcado como completado.")
+        if not check.data or int(check.data[0]['usuario_id']) != interaction.user.id:
+            return await interaction.response.send_message(
+                "❌ No encontrado o sin permiso.", ephemeral=True
+            )
+        client.supabase.table("recordatorios")\
+            .update({"completado": True}).eq("id", id_tarea).execute()
+        await interaction.response.send_message(f"✅ Recordatorio `{id_tarea}` marcado como completado.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── /buscar ───────────────────────────────────────────────────────────────────
 @client.tree.command(name="buscar", description="Busca recordatorios por texto en el título o descripción")
 @app_commands.describe(texto="Texto a buscar")
 async def buscar(interaction: discord.Interaction, texto: str):
-    patron = f"%{texto}%"
-    async with client.db.execute(
-        """SELECT * FROM recordatorios WHERE usuario_id=? AND completado=0
-           AND (tarea LIKE ? OR descripcion LIKE ?)
-           ORDER BY fecha_ejecucion""",
-        (interaction.user.id, patron, patron)
-    ) as cur:
-        filas = await cur.fetchall()
+    try:
+        por_tarea = client.supabase.table("recordatorios")\
+            .select("*")\
+            .eq("usuario_id", interaction.user.id)\
+            .eq("completado", False)\
+            .ilike("tarea", f"%{texto}%")\
+            .order("fecha_ejecucion")\
+            .execute()
 
-    if not filas:
-        return await interaction.response.send_message(
-            f"No hay recordatorios pendientes con '{texto}'.", ephemeral=True
-        )
+        por_desc = client.supabase.table("recordatorios")\
+            .select("*")\
+            .eq("usuario_id", interaction.user.id)\
+            .eq("completado", False)\
+            .ilike("descripcion", f"%{texto}%")\
+            .order("fecha_ejecucion")\
+            .execute()
 
-    embed = discord.Embed(title=f"🔍 Resultados para '{texto}'", color=discord.Color.teal())
-    for r in filas:
-        fecha_local = _dt_de_db(r['fecha_ejecucion']).astimezone(ZONA_ES)
-        embed.add_field(
-            name=f"🆔 {r['id']} — {r['tarea']}",
-            value=f"🕒 {fecha_local.strftime('%d/%m/%Y a las %H:%M')}\n{r['descripcion'] or 'Sin detalles'}",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed)
+        ids_vistos = set()
+        filas = []
+        for r in por_tarea.data + por_desc.data:
+            if r['id'] not in ids_vistos:
+                ids_vistos.add(r['id'])
+                filas.append(r)
+        filas.sort(key=lambda x: x['fecha_ejecucion'])
+
+        if not filas:
+            return await interaction.response.send_message(
+                f"No hay recordatorios pendientes con '{texto}'.", ephemeral=True
+            )
+
+        embed = discord.Embed(title=f"🔍 Resultados para '{texto}'", color=discord.Color.teal())
+        for r in filas:
+            fecha_local = _dt_de_str(r['fecha_ejecucion']).astimezone(ZONA_ES)
+            embed.add_field(
+                name=f"🆔 {r['id']} — {r['tarea']}",
+                value=f"🕒 {fecha_local.strftime('%d/%m/%Y a las %H:%M')}\n{r.get('descripcion') or 'Sin detalles'}",
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
 # ── Arranque ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    keep_alive()
     client.run(os.getenv("DISCORD_TOKEN"))

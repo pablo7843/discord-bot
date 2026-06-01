@@ -1,5 +1,6 @@
 discord.py
-aiosqlite
+supabase
 python-dotenv
 pytz
 dateparser
+flask
